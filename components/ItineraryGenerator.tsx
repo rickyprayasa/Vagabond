@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { NeoButton } from './ui/NeoButton';
 import { NeoCard } from './ui/NeoCard';
 import { generateItinerary, generateActivitySuggestions, generatePackingSuggestions, generatePlaceSuggestions, SuggestedActivity, SuggestedPackingItem } from '../services/geminiService';
+import { itineraryService } from '../services/itineraryService';
 import { Itinerary, TravelPreferences, Activity, DayPlan, User } from '../types';
 import { MapPin, Calendar, Wallet, Loader2, Share2, Save, Plane, Dices, Music, Luggage, MessageSquare, Bed, Utensils, Ticket, Car, ThumbsUp, ThumbsDown, PieChart, FileDown, GripVertical, Clock, Trash2, ArrowRightLeft, Pencil, X, Plus, Smile, AlignLeft, Map, Grip, Users, Bus, Check, CloudSun, Coins, Settings, Fuel, AlertTriangle, Sparkles, Disc, Cloud, FolderPlus, Navigation, ChevronDown, RefreshCw, ArrowRight, Search, Sun, Moon, Sunrise, Sunset, Star, Globe, Flag, Compass } from 'lucide-react';
 import { motion, AnimatePresence, Reorder, useDragControls } from 'framer-motion';
@@ -12,7 +13,8 @@ import autoTable from "jspdf-autotable";
 interface ItineraryGeneratorProps {
   language: Language;
   user: User;
-  onDeductCredits: (amount: number) => boolean;
+  userId: string;
+  onDeductCredits: (amount: number) => Promise<boolean>;
   onRequireLogin: () => void;
   onRequireCredits: () => void;
   loadedItinerary?: Itinerary | null;
@@ -391,84 +393,41 @@ const SortableDay: React.FC<SortableDayProps> = ({
   );
 };
 
-export const ItineraryGenerator: React.FC<ItineraryGeneratorProps> = ({ language, user, onDeductCredits, onRequireLogin, onRequireCredits, loadedItinerary }) => {
+export const ItineraryGenerator: React.FC<ItineraryGeneratorProps> = ({ language, user, userId, onDeductCredits, onRequireLogin, onRequireCredits, loadedItinerary }) => {
   const [loading, setLoading] = useState(false);
-  
-  // -- STATE MANAGEMENT WITH PERSISTENCE --
 
-  // 1. Itinerary Result: Initialize from localStorage if available
-  const [itinerary, setItinerary] = useState<Itinerary | null>(() => {
-    if (typeof window !== 'undefined') {
-        try {
-            const saved = localStorage.getItem('vagabond_current_result');
-            // Ensure saved data is valid object, otherwise null to prevent crashes
-            if (saved && saved !== "undefined" && saved !== "null") {
-                const parsed = JSON.parse(saved);
-                return (parsed && typeof parsed === 'object') ? parsed : null;
-            }
-        } catch (e) { return null; }
-    }
-    return null;
-  });
+  // -- STATE MANAGEMENT --
 
-  // 2. Active Tab: Initialize based on whether there's an itinerary
-  const [activeTab, setActiveTab] = useState<'itinerary' | 'essentials' | 'config'>(() => {
-     if (typeof window !== 'undefined') {
-         const saved = localStorage.getItem('vagabond_current_result');
-         if (saved && saved !== "undefined" && saved !== "null") {
-             return 'itinerary';
-         }
-     }
-     return 'config';
-  });
+  // 1. Itinerary Result: Initialize from loadedItinerary prop or null
+  const [itinerary, setItinerary] = useState<Itinerary | null>(loadedItinerary || null);
 
-  // 3. Preferences (Draft): Initialize from localStorage
-  const [prefs, setPrefs] = useState<TravelPreferences>(() => {
-    const defaultPrefs: TravelPreferences = {
-        origin: '',
-        destination: '',
-        days: 3,
-        budget: 'Moderate',
-        interests: [],
-        travelers: 1,
-        transportMode: 'Public Transport',
-        travelStyle: 'Relaxed' // Default
-    };
-    if (typeof window !== 'undefined') {
-        try {
-            const saved = localStorage.getItem('vagabond_trip_draft');
-            if (saved && saved !== "undefined") {
-                const parsed = JSON.parse(saved);
-                // Defensive merge to prevent "undefined" values if schema changed
-                return { 
-                    ...defaultPrefs, 
-                    ...parsed,
-                    interests: Array.isArray(parsed.interests) ? parsed.interests : [], // Ensure array
-                    transportMode: parsed.transportMode || 'Public Transport', // Ensure string
-                    travelStyle: parsed.travelStyle || 'Relaxed' // Ensure string
-                };
-            }
-        } catch(e) {}
-    }
-    return defaultPrefs;
-  });
+  // 2. Active Tab: Initialize based on loaded itinerary
+  const [activeTab, setActiveTab] = useState<'itinerary' | 'essentials' | 'config'>(
+    loadedItinerary ? 'itinerary' : 'config'
+  );
 
-  // -- PERSISTENCE EFFECTS --
+  // 3. Preferences (Draft): Initialize with default values
+  const [prefs, setPrefs] = useState<TravelPreferences>(() => ({
+    origin: '',
+    destination: '',
+    days: 3,
+    budget: 'Moderate',
+    interests: [],
+    travelers: 1,
+    transportMode: 'Public Transport',
+    travelStyle: 'Relaxed'
+  }));
 
-  // Save prefs to localStorage whenever they change
+  // Update itinerary when loadedItinerary changes
   useEffect(() => {
-      localStorage.setItem('vagabond_trip_draft', JSON.stringify(prefs));
-  }, [prefs]);
-
-  // Save itinerary to localStorage whenever it changes
-  useEffect(() => {
-      if (itinerary) {
-          localStorage.setItem('vagabond_current_result', JSON.stringify(itinerary));
-      } else {
-          // If explicitly set to null (e.g. user clears it), remove from storage
-          localStorage.removeItem('vagabond_current_result');
+    if (loadedItinerary) {
+      setItinerary(loadedItinerary);
+      setActiveTab('itinerary');
+      if (loadedItinerary.originalPrefs) {
+        setPrefs(loadedItinerary.originalPrefs);
       }
-  }, [itinerary]);
+    }
+  }, [loadedItinerary]);
 
   const [feedbackState, setFeedbackState] = useState<'idle' | 'positive' | 'negative_input' | 'submitted'>('idle');
   const [isEditMode, setIsEditMode] = useState(false);
@@ -924,31 +883,30 @@ export const ItineraryGenerator: React.FC<ItineraryGeneratorProps> = ({ language
   };
 
   const handleSave = async () => {
-    if (!itinerary) return;
+    if (!itinerary || !user.isLoggedIn) {
+      onRequireLogin();
+      return;
+    }
+
     setSaveStatus('saving');
-    
-    await new Promise(resolve => setTimeout(resolve, 800));
 
     try {
-      const existing = localStorage.getItem('vagabond_saved_itineraries');
-      const savedItineraries: Itinerary[] = existing ? JSON.parse(existing) : [];
-      
-      const exists = savedItineraries.some(
-        item => item.destination === itinerary.destination && item.title === itinerary.title
-      );
+      await itineraryService.saveItinerary(userId, itinerary, {
+        origin: prefs.origin,
+        destination: prefs.destination,
+        days: prefs.days,
+        budget: prefs.budget,
+        interests: prefs.interests,
+        travelers: prefs.travelers,
+        transportMode: prefs.transportMode,
+        travelStyle: prefs.travelStyle
+      });
 
-      if (!exists) {
-        savedItineraries.push(itinerary);
-        localStorage.setItem('vagabond_saved_itineraries', JSON.stringify(savedItineraries));
-        setSaveStatus('saved');
-        setTimeout(() => setSaveStatus('idle'), 2000);
-      } else {
-        alert("This itinerary is already saved!");
-        setSaveStatus('idle');
-      }
+      setSaveStatus('saved');
+      setTimeout(() => setSaveStatus('idle'), 2000);
     } catch (error) {
       console.error("Save failed", error);
-      alert("Failed to save to local storage.");
+      alert(language === 'id' ? 'Gagal menyimpan itinerary' : 'Failed to save itinerary');
       setSaveStatus('idle');
     }
   };
